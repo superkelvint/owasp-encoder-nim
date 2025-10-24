@@ -1,6 +1,5 @@
 # xmlcommentencoder.nim
 import encoder
-import std/unicode
 
 const
   HYPHEN_REPLACEMENT* = '~'

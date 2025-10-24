@@ -1,6 +1,5 @@
 # cssencoder.nim
 import encoder
-import std/unicode
 import std/strutils
 
 const

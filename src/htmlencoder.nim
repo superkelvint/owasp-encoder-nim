@@ -1,6 +1,5 @@
 # htmlencoder.nim
 import encoder
-import std/unicode
 
 const
   # This is the replacement char used in the Java default case

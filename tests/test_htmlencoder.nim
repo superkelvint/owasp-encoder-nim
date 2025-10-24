@@ -2,7 +2,6 @@
 import unittest
 import encoder_test_suite_builder # Our helper module
 import htmlencoder                # Your htmlencoder.nim module
-import encoder                    # For the base encode() proc
 import std/unicode # for Rune
 
 # Helper to create string from a Unicode codepoint

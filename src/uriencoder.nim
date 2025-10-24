@@ -1,6 +1,5 @@
 # uriencoder.nim
 import encoder
-import std/unicode
 
 const
   UHEX: array[16, char] =

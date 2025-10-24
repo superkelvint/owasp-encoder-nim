@@ -1,6 +1,5 @@
 # cdataencoder.nim
 import encoder
-import std/unicode
 
 const
   CDATA_END_ENCODED* = "]]]]><![CDATA[>"

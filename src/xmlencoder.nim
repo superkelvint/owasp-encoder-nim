@@ -1,6 +1,5 @@
 # xmlencoder.nim
 import encoder
-import std/unicode
 
 const
   INVALID_CHARACTER_REPLACEMENT* = ' '

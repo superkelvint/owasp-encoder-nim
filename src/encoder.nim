@@ -5,12 +5,12 @@ type
   Encoder* = ref object of RootObj
     ## Base type for encoder implementations.
 
-method encodeInternal*(encoder: Encoder, input: string, output: var string) {.raises: [].} =
+method encodeInternal*(encoder: Encoder, input: string, output: var string) {.base, raises: [].} =
   ## Default implementation that appends input to output without encoding.
   ## Subclasses should override this method to provide custom encoding.
   output.add(input)
 
-method firstEncodedOffset*(encoder: Encoder, input: string, off: int, len: int): int {.raises: [].} =
+method firstEncodedOffset*(encoder: Encoder, input: string, off: int, len: int): int {.base, raises: [].} =
   ## Finds the first character position that needs encoding.
   ## Default implementation indicates no encoding is needed.
   ## Returns the offset of the first character that needs encoding, or off + len if none.

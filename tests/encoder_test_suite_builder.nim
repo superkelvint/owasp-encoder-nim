@@ -1,4 +1,3 @@
-import unittest
 import std/strutils, std/strformat
 import std/unicode
 import encoder
@@ -186,7 +185,7 @@ proc totalCardinality(builder: EncoderTestSuiteBuilder): int =
 proc validSuite*(builder: EncoderTestSuiteBuilder): EncoderTestSuiteBuilder =
   let cardinality = builder.totalCardinality()
   if cardinality != MaxCodePoint + 1:
-    raise newException(AssertionError, 
+    raise newException(Defect, 
       fmt"incomplete coverage: {cardinality} != {MaxCodePoint + 1}")
   
   # Test low codepoints (0-0xFFFF)
