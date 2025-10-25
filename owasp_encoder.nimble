@@ -1,4 +1,4 @@
-version       = "0.5.1"
+version       = "0.5.2"
 author        = "Kelvin Tan" # <-- TODO: Update this
 description   = "A Nim port of the OWASP Java Encoder for context-aware, secure output encoding."
 license       = "BSD-3-Clause"   # Matches the original Java project
