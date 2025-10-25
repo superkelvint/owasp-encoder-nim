@@ -1,6 +1,7 @@
 # cssencoder.nim
 import encoder
 import std/strutils
+import std/unicode # ADDED: For Rune functions
 
 const
   LHEX: array[16, char] =
@@ -63,11 +64,40 @@ proc newCSSEncoder*(mode: CSSEncoderMode): CSSEncoder =
     result.lowMask = URL_MASK_LOW
     result.highMask = URL_MASK_HIGH
 
+# Helper proc to write hex (mimics Java's direct array write)
+proc writeHex*(output: var string, cp: int) =
+  # Use a fixed size for the temporary hex representation (e.g., 6 digits for max Unicode)
+  # NOTE: The simplest, fastest, and lowest-level way in Nim is often to rely on 
+  # strutils.toHex and then manually writing the result, but since that was the issue, 
+  # we must use manual char calculation or a custom template.
+  
+  # Since we cannot rely on toHex, we write directly to simulate array assignment.
+  
+  const maxDigits = 6
+  var temp: array[maxDigits, char]
+  var p = maxDigits - 1
+  var val = cp
+
+  if val == 0:
+    # Special case for U+0000
+    output.add('0')
+    return
+
+  while val > 0 and p >= 0:
+    temp[p] = LHEX[val and HEX_MASK]
+    val = val shr HEX_SHIFT
+    p -= 1
+    
+  # Find the start of the hex string (skip leading zeros, but always output at least one char)
+  var start = p + 1
+  
+  for j in start ..< maxDigits:
+    output.add(temp[j])
+
 method firstEncodedOffset*(
     encoder: CSSEncoder, input: string, off: int, len: int
 ): int =
   ## Finds the first ASCII character position that needs encoding.
-  ## Bails on the first non-ASCII char, letting encodeInternal handle it.
   let n = off + len
   var i = off
   while i < n:
@@ -85,80 +115,47 @@ method firstEncodedOffset*(
         continue
 
     # If we're here, cp is 0..127 but not in the valid mask
-    # or it's a non-ASCII char (>127) that is not allowed.
-    # The Java source logic for non-ASCII is complex (allows > 237 etc)
-    # but for the ASCII-only fast path, this is correct.
-    # Wait, the Java check is `ch > '\237'` (159).
-    # Chars 0-127 are either in the mask or not.
     if cp <= 127:
       return i # ASCII char that needs encoding
     
-    # This part handles 128-159 and 2028, 2029
+    # This part handles non-ASCII ranges that must be encoded (128-159 and separators)
+    # The original Java logic allows non-encoded non-ASCII, but the fast path must return
+    # to the main loop for multi-byte decoding.
     if cp > 159 and cp < LINE_SEPARATOR or cp > PARAGRAPH_SEPARATOR:
       if cp < MIN_HIGH_SURROGATE or cp > MAX_LOW_SURROGATE:
-        # Valid non-ascii, but this is the *fast path*.
-        # We must bail to `encodeInternal` to handle UTF-8 sequences.
+        # Valid non-ascii. We must bail to `encodeInternal` to handle UTF-8 sequences.
         return i 
 
     # If we are here, it's a non-ASCII char that needs encoding.
-    # (e.g., 128-159, or 2028, 2029, or surrogates)
-    # We bail to encodeInternal to handle the full UTF-8 char.
     return i
 
   return n
 
 method encodeInternal*(encoder: CSSEncoder, input: string, output: var string) =
-  ## Encodes the input string by iterating over Runes (Unicode codepoints)
+  ## Encodes the input string by iterating over Runes (Unicode codepoints) using Safe Chunking.
   var i = 0
+  var lastSafe = 0 # TRACKER: Start of the current safe chunk
+  
   while i < input.len:
-    let b = input[i].uint8
+    let charLen = runeLenAt(input, i) # REPLACED: manual UTF-8 decoding
+    let cpRune = input.runeAt(i)       # REPLACED: manual UTF-8 decoding
+    let cp = cpRune.int
+    let nextI = i + charLen
 
-    # --- UTF-8 decoding, adapted from uriencoder.nim ---
-    let (cp, nextI) =
-      if (b and 0x80) == 0:
-        # 1-byte ASCII (0xxxxxxx)
-        (int(b), i + 1)
-      elif (b and 0xE0) == 0xC0 and i + 1 < input.len:
-        # 2-byte UTF-8 (110xxxxx 10xxxxxx)
-        let b2 = input[i + 1].uint8
-        if (b2 and 0xC0) == 0x80:
-          (((b and 0x1F).int shl 6) or (b2 and 0x3F).int, i + 2)
-        else:
-          (int(INVALID_REPLACEMENT_CHARACTER), i + 1) # Invalid continuation
-      elif (b and 0xF0) == 0xE0 and i + 2 < input.len:
-        # 3-byte UTF-8 (1110xxxx 10xxxxxx 10xxxxxx)
-        let b2 = input[i + 1].uint8
-        let b3 = input[i + 2].uint8
-        if (b2 and 0xC0) == 0x80 and (b3 and 0xC0) == 0x80:
-          (
-            ((b and 0x0F).int shl 12) or ((b2 and 0x3F).int shl 6) or (b3 and 0x3F).int,
-            i + 3,
-          )
-        else:
-          (int(INVALID_REPLACEMENT_CHARACTER), i + 1) # Invalid continuation
-      elif (b and 0xF8) == 0xF0 and i + 3 < input.len:
-        # 4-byte UTF-8 (11110xxx 10xxxxxx 10xxxxxx 10xxxxxx)
-        let b2 = input[i + 1].uint8
-        let b3 = input[i + 2].uint8
-        let b4 = input[i + 3].uint8
-        if (b2 and 0xC0) == 0x80 and (b3 and 0xC0) == 0x80 and (b4 and 0xC0) == 0x80:
-          (
-            ((b and 0x07).int shl 18) or ((b2 and 0x3F).int shl 12) or
-              ((b3 and 0x3F).int shl 6) or (b4 and 0x3F).int,
-            i + 4,
-          )
-        else:
-          (int(INVALID_REPLACEMENT_CHARACTER), i + 1) # Invalid continuation
-      else:
-        # Invalid UTF-8 sequence or incomplete multibyte at end
-        (int(INVALID_REPLACEMENT_CHARACTER), i + 1)
-
-    # --- CSSEncoder-specific logic (from CSSEncoder.java) ---
+    # --- INVALID UTF-8 HANDLING ---
+    if charLen == 0:
+        if i > lastSafe: output.add(input[lastSafe ..< i])
+        output.add(INVALID_REPLACEMENT_CHARACTER)
+        i = i + 1 
+        lastSafe = i
+        continue
 
     var needsEncoding = false
     var isInvalid = false
-
-    if cp == int(INVALID_REPLACEMENT_CHARACTER) or (cp >= MIN_HIGH_SURROGATE and cp <= MAX_LOW_SURROGATE):
+    
+    # --- CSSEncoder-specific logic (from CSSEncoder.java) ---
+    
+    if cp >= MIN_HIGH_SURROGATE and cp <= MAX_LOW_SURROGATE:
       isInvalid = true
     elif cp < (2 * LONG_BITS): # ASCII
       if cp < LONG_BITS:
@@ -169,15 +166,20 @@ method encodeInternal*(encoder: CSSEncoder, input: string, output: var string) =
       # This is "nonascii" and is valid, no encoding needed.
       needsEncoding = false
     else:
-      # Needs encoding. This covers:
-      # - 0-127 not in masks
-      # - 128-159 (which are not in "nonascii" range)
-      # - LINE_SEPARATOR and PARAGRAPH_SEPARATOR
+      # This covers: 0-127 not in masks, 128-159, LINE_SEPARATOR, PARAGRAPH_SEPARATOR
       needsEncoding = true
+    
+    # --- OUTPUT LOGIC (Safe Chunking) ---
 
     if isInvalid:
+      # FLUSH: Emit preceding safe chunk
+      if i > lastSafe: output.add(input[lastSafe ..< i])
       output.add(INVALID_REPLACEMENT_CHARACTER)
+      lastSafe = nextI
     elif needsEncoding:
+      # FLUSH: Emit preceding safe chunk
+      if i > lastSafe: output.add(input[lastSafe ..< i])
+      
       # --- Hex-escape logic from CSSEncoder.java ---
       var needsSpace = false
       if nextI < input.len:
@@ -188,25 +190,20 @@ method encodeInternal*(encoder: CSSEncoder, input: string, output: var string) =
            la == ' ' or la == '\n' or la == '\r' or la == '\t' or la == '\f':
           needsSpace = true
 
-      # Add the hex escape
+      # ADD THE ESCAPE (Direct Writes)
       output.add('\\')
-
-      # Convert codepoint to hex string
-      # (Using strutils.toHex is simpler than the Java backwards-write)
-      if cp == 0:
-        output.add('0')
-      else:
-        var hexStr = toHex(cp).toLowerAscii()
-        # Remove leading zeros from the hex string
-        var j = 0
-        while j < hexStr.len - 1 and hexStr[j] == '0':
-          inc j
-        output.add(hexStr[j..^1])
-
+      writeHex(output, cp) # Optimized hex writing
+      
       if needsSpace:
         output.add(' ')
+        
+      lastSafe = nextI
     else:
-      # Valid character, no encoding needed - add it as-is
-      output.add(input[i ..< nextI])
+      # Valid character, no encoding needed - continue to extend safe chunk
+      discard
 
     i = nextI
+    
+  # FINAL FLUSH: Copy the final safe chunk
+  if input.len > lastSafe:
+    output.add(input[lastSafe ..< input.len])
