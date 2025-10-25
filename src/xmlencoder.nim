@@ -148,35 +148,54 @@ method firstEncodedOffset*(
 
 
 method encodeInternal*(encoder: XMLEncoder, input: string, output: var string) =
-  ## Encodes the input string by iterating over Runes (Unicode codepoints)
+  ## Encodes the input string using two loops: fast ASCII path + Rune processing.
   var i = 0
-  var lastSafe = 0 # TRACKER: New variable to mark the start of the current safe chunk
+  var lastSafe = 0 
   
   while i < input.len:
+    # --- FAST ASCII PASS-THROUGH LOOP (Bulk Skip) ---
+    var fastI = i
+    while fastI < input.len:
+        let b = input[fastI].uint8
+        
+        # Break 1: Non-ASCII (b >= 127)
+        if b >= DEL.uint8: break 
+
+        # Break 2: Character requires encoding or special handling (Invalid control, encoded char).
+        # This condition MUST be FALSE to continue skipping.
+        # It replicates the Java logic: if (ch > '>' || ((_validMask & (1L << ch)) != 0))
+        if not (b > '>'.uint8 or (encoder.validMask and (1'u64 shl b.int)) != 0):
+            break
+        
+        fastI += 1
+
+    # FLUSH: Copy the entire safe ASCII chunk if any was found
+    if fastI > i:
+        if i > lastSafe: output.add(input[lastSafe ..< i]) # Flush preceding Rune safe chunk
+        output.add(input[i ..< fastI]) # Copy the new ASCII safe chunk
+        lastSafe = fastI
+        i = fastI
+        continue # Restart outer loop (moves to Rune path only if no more ASCII skips are possible)
+
+    # If we are here, 'i' points to a character that is non-ASCII or requires encoding/replacement.
+    
+    # --- RUNE PROCESSING LOOP (Single Character Handling) ---
     let charLen = runeLenAt(input, i)
     let cpRune = input.runeAt(i)
     let cp = cpRune.int
     let nextI = i + charLen
 
-    # --- XMLEncoder-specific logic (from XMLEncoder.java) ---
-
     if charLen == 0:
-        # FLUSH: Emit preceding safe chunk
+        # Invalid UTF-8 sequence
         if i > lastSafe: output.add(input[lastSafe ..< i])
-        
-        # EMIT: Replacement
         output.add(INVALID_CHARACTER_REPLACEMENT)
-        
-        i = i + 1 # Must advance by at least one byte on error
-        lastSafe = i # UPDATE: Mark the start of the new safe chunk
+        i = i + 1 
+        lastSafe = i
         continue
 
     elif cp < DEL: # 0-126
-      if (cp > '>'.int) or ((encoder.validMask and (1'u64 shl cp)) != 0):
-        # Valid ASCII, DO NOT FLUSH/EMIT, just continue to extend the safe chunk
-        discard 
-      else:
-        # FLUSH: Emit preceding safe chunk
+        # This path only handles encoded chars (like &) and control chars (like \n, \t) 
+        # that were intentionally skipped by the fast path.
         if i > lastSafe: output.add(input[lastSafe ..< i])
         
         # EMIT: Encoded char or replacement
@@ -186,87 +205,71 @@ method encodeInternal*(encoder: XMLEncoder, input: string, output: var string) =
         of '>'.int: output.add("&gt;")
         of '\''.int: output.add("&#39;")
         of '"'.int: output.add("&#34;")
-        else: output.add(INVALID_CHARACTER_REPLACEMENT) # e.g. \0, \1, etc.
+        else: output.add(INVALID_CHARACTER_REPLACEMENT) 
         
-        lastSafe = nextI # UPDATE: Mark the start of the new safe chunk
+        lastSafe = nextI 
 
     elif cp < MIN_HIGH_SURROGATE: # 127 - 0xD7FF
       # Java logic: if (ch > Unicode.MAX_C1_CTRL_CHAR || ch == Unicode.NEL)
       if (cp > MAX_C1_CTRL_CHAR or cp == NEL):
-        # Valid non-ASCII, continue to extend the safe chunk
-        discard
+        # Valid non-ASCII.
+        discard 
       else:
         # FLUSH: Emit preceding safe chunk
         if i > lastSafe: output.add(input[lastSafe ..< i])
         
         # EMIT: Replacement
         output.add(INVALID_CHARACTER_REPLACEMENT)
-        
-        lastSafe = nextI # UPDATE: Mark the start of the new safe chunk
+        lastSafe = nextI 
         
     elif cp <= MAX_LOW_SURROGATE: # 0xD800 - 0xDFFF (Surrogate range)
       var handled = false
-      # Check if it's a HIGH surrogate (0xD800 - 0xDBFF)
       if cp <= MAX_HIGH_SURROGATE:
-        # It's a high surrogate. Peek at the next codepoint.
         if nextI < input.len:
           let charLen2 = runeLenAt(input, nextI)
           let cp2Rune = input.runeAt(nextI)
           let cp2 = cp2Rune.int
           let nextI2 = nextI + charLen2
           
-          # Check if next is a LOW surrogate (0xDC00 - 0xDFFF)
           if cp2 >= 0xDC00 and cp2 <= MAX_LOW_SURROGATE:
-            # We have a valid pair!
             let combinedCp = 0x10000 + ((cp - MIN_HIGH_SURROGATE) shl 10) + (cp2 - 0xDC00)
 
             if isNonCharacter(combinedCp):
-              # FLUSH: Emit preceding safe chunk
               if i > lastSafe: output.add(input[lastSafe ..< i])
-              # EMIT: Invalid pair is replaced by *one* space.
               output.add(INVALID_CHARACTER_REPLACEMENT)
-              
-              i = nextI2 # Consume both codepoints
-              lastSafe = i # UPDATE: Mark the start of the new safe chunk
+              i = nextI2 
+              lastSafe = i 
               handled = true
-              continue # Continue to next loop iteration
+              continue 
             else:
-              # Valid surrogate pair. Continue to extend the safe chunk.
+              # Valid surrogate pair. Advance i.
               i = nextI2
               handled = true
-              continue # Continue to next loop iteration
+              continue 
         
       if not handled:
-        # FLUSH: Emit preceding safe chunk
         if i > lastSafe: output.add(input[lastSafe ..< i])
-        
-        # This handles isolated surrogates (high or low)
         output.add(INVALID_CHARACTER_REPLACEMENT)
-        lastSafe = nextI # UPDATE: Mark the start of the new safe chunk
+        lastSafe = nextI 
 
 
     elif cp >= 0xFDD0: # Check for non-characters
       if isNonCharacter(cp):
-        # FLUSH: Emit preceding safe chunk
         if i > lastSafe: output.add(input[lastSafe ..< i])
-        # EMIT: Replacement
         output.add(INVALID_CHARACTER_REPLACEMENT) 
-        lastSafe = nextI # UPDATE: Mark the start of the new safe chunk
+        lastSafe = nextI 
       elif cp <= 0x10FFFF:
-        # Valid, continue to extend the safe chunk
         discard
       else:
-        # FLUSH: Emit preceding safe chunk
         if i > lastSafe: output.add(input[lastSafe ..< i])
-        # EMIT: Replacement (> 0x10FFFF)
         output.add(INVALID_CHARACTER_REPLACEMENT) 
-        lastSafe = nextI # UPDATE: Mark the start of the new safe chunk
+        lastSafe = nextI
 
     else:
       # All other valid chars (e.g., U+E000 - U+FDCF)
-      # Valid, continue to extend the safe chunk
       discard
 
+    # Advance i for non-encoded, non-surrogate characters.
     i = nextI
     
   # FINAL FLUSH: Copy the final safe chunk
