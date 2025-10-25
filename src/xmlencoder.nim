@@ -1,5 +1,6 @@
 # xmlencoder.nim
 import encoder
+import std/unicode # For Rune, runeAt, runeLenAt, and size
 
 const
   INVALID_CHARACTER_REPLACEMENT* = ' '
@@ -57,47 +58,6 @@ proc newXMLEncoder*(mode: XMLEncoderMode): XMLEncoder =
   # Java logic: BASE_VALID_MASK | ((-1L << ' ') & ~(encodeMask))
   result.validMask = BASE_VALID_MASK or (VALID_ASCII_MASK and (not encodeMask))
 
-proc decodeUtf8(s: string, i: int): (int, int) =
-  ## Decodes a single UTF-8 codepoint from string `s` starting at index `i`.
-  ## Returns (codepoint, next_index).
-  ## Based on the logic originally in encodeInternal.
-  if i >= s.len:
-    return (0, i) # Should not happen if called correctly
-
-  let b = s[i].uint8
-
-  if (b and 0x80) == 0:
-    # 1-byte sequence (0xxxxxxx)
-    return (int(b), i + 1)
-  elif (b and 0xE0) == 0xC0 and i + 1 < s.len:
-    # 2-byte sequence (110xxxxx 10xxxxxx)
-    let b2 = s[i + 1].uint8
-    if (b2 and 0xC0) == 0x80:
-      return (((b and 0x1F).int shl 6) or (b2 and 0x3F).int, i + 2)
-    else:
-      return (int(INVALID_CHARACTER_REPLACEMENT), i + 1) # Invalid 2-byte seq
-  elif (b and 0xF0) == 0xE0 and i + 2 < s.len:
-    # 3-byte sequence (1110xxxx 10xxxxxx 10xxxxxx)
-    let b2 = s[i + 1].uint8
-    let b3 = s[i + 2].uint8
-    if (b2 and 0xC0) == 0x80 and (b3 and 0xC0) == 0x80:
-      return (((b and 0x0F).int shl 12) or ((b2 and 0x3F).int shl 6) or (b3 and 0x3F).int, i + 3)
-    else:
-      return (int(INVALID_CHARACTER_REPLACEMENT), i + 1) # Invalid 3-byte seq
-  elif (b and 0xF8) == 0xF0 and i + 3 < s.len:
-    # 4-byte sequence (11110xxx 10xxxxxx 10xxxxxx 10xxxxxx)
-    let b2 = s[i + 1].uint8
-    let b3 = s[i + 2].uint8
-    let b4 = s[i + 3].uint8
-    if (b2 and 0xC0) == 0x80 and (b3 and 0xC0) == 0x80 and (b4 and 0xC0) == 0x80:
-      return (((b and 0x07).int shl 18) or ((b2 and 0x3F).int shl 12) or
-        ((b3 and 0x3F).int shl 6) or (b4 and 0x3F).int, i + 4)
-    else:
-      return (int(INVALID_CHARACTER_REPLACEMENT), i + 1) # Invalid 4-byte seq
-  else:
-    # Invalid start byte (e.g., 10xxxxxx) or truncated sequence
-    return (int(INVALID_CHARACTER_REPLACEMENT), i + 1)
-
 proc isNonCharacter(cp: int): bool =
   ## Checks if a codepoint is an XML non-character.
   if (cp >= 0xFDD0 and cp <= 0xFDEF): return true
@@ -109,21 +69,21 @@ method firstEncodedOffset*(
     encoder: XMLEncoder, input: string, off: int, len: int
 ): int =
   ## Finds the first character position that needs encoding.
-  ## This is a full-featured fast path that validates all Unicode.
-
   let n = off + len
   var i = off
   while i < n:
-    let (cp, nextI) = decodeUtf8(input, i)
+    let charLen = runeLenAt(input, i)
+    let cpRune = input.runeAt(i)
+    let cp = cpRune.int
+    let nextI = i + charLen
 
     # --- XMLEncoder-specific logic (from XMLEncoder.java) ---
-    # This logic mirrors encodeInternal, but returns 'i' on failure
-    # instead of adding to an output string.
 
-    if cp == int(INVALID_CHARACTER_REPLACEMENT):
-      return i # Invalid UTF-8 sequence
+    if charLen == 0:
+      # Invalid UTF-8 sequence, flagged for replacement
+      return i 
 
-    elif cp < DEL: # 0-126
+    elif cp < DEL: # 0-126 (Covers all non-encoded, non-valid ASCII)
       if (cp > '>'.int) or ((encoder.validMask and (1'u64 shl cp)) != 0):
         discard # Valid ASCII, continue
       else:
@@ -134,7 +94,7 @@ method firstEncodedOffset*(
         else:
           return i # Invalid control char e.g. \0, \1, etc.
 
-    elif cp < MIN_HIGH_SURROGATE: # 127 - 0xD7FF
+    elif cp < MIN_HIGH_SURROGATE: # 127 (DEL) - 0xD7FF
       # Java logic: if (ch > Unicode.MAX_C1_CTRL_CHAR || ch == Unicode.NEL)
       if (cp > MAX_C1_CTRL_CHAR or cp == NEL):
         discard # Valid (e.g., 0xA0)
@@ -147,7 +107,10 @@ method firstEncodedOffset*(
       if cp <= MAX_HIGH_SURROGATE:
         # It's a high surrogate.Peek at the next codepoint.
         if nextI < n: # Use 'n' (end) not 'input.len'
-          let (cp2, nextI2) = decodeUtf8(input, nextI)
+          let charLen2 = runeLenAt(input, nextI)
+          let cp2Rune = input.runeAt(nextI)
+          let cp2 = cp2Rune.int
+          let nextI2 = nextI + charLen2
           
           # Check if next is a LOW surrogate (0xDC00 - 0xDFFF)
           if cp2 >= 0xDC00 and cp2 <= MAX_LOW_SURROGATE:
@@ -157,19 +120,13 @@ method firstEncodedOffset*(
 
             if isNonCharacter(combinedCp):
               # Invalid pair (e.g., U+1FFFE).
-
               return i # Return index of the *start* of the invalid pair
             else:
               # Valid surrogate pair (e.g., U+10000).
-              # Pass them through.
               i = nextI2 # Consume both codepoints
               continue # Continue to next loop iteration
         
-      # If we're here, it's a high surrogate *without* a following low surrogate.
-      # Fall through to the invalid case.
-      # This handles:
-      # 1. Isolated low surrogates (0xDC00 - 0xDFFF)
-      # 2. Isolated high surrogates (fell through from above)
+      # If we're here, it's an isolated surrogate (high or low)
       return i # Invalid surrogate
 
     elif cp >= 0xFDD0: # Check for non-characters
@@ -193,81 +150,125 @@ method firstEncodedOffset*(
 method encodeInternal*(encoder: XMLEncoder, input: string, output: var string) =
   ## Encodes the input string by iterating over Runes (Unicode codepoints)
   var i = 0
+  var lastSafe = 0 # TRACKER: New variable to mark the start of the current safe chunk
+  
   while i < input.len:
-    let (cp, nextI) = decodeUtf8(input, i)
+    let charLen = runeLenAt(input, i)
+    let cpRune = input.runeAt(i)
+    let cp = cpRune.int
+    let nextI = i + charLen
 
     # --- XMLEncoder-specific logic (from XMLEncoder.java) ---
 
-    if cp == int(INVALID_CHARACTER_REPLACEMENT):
+    if charLen == 0:
+        # FLUSH: Emit preceding safe chunk
+        if i > lastSafe: output.add(input[lastSafe ..< i])
+        
+        # EMIT: Replacement
         output.add(INVALID_CHARACTER_REPLACEMENT)
+        
+        i = i + 1 # Must advance by at least one byte on error
+        lastSafe = i # UPDATE: Mark the start of the new safe chunk
+        continue
 
     elif cp < DEL: # 0-126
       if (cp > '>'.int) or ((encoder.validMask and (1'u64 shl cp)) != 0):
-        output.add(input[i ..< nextI]) # Valid ASCII
+        # Valid ASCII, DO NOT FLUSH/EMIT, just continue to extend the safe chunk
+        discard 
       else:
-        # Needs encoding or is invalid ASCII control
+        # FLUSH: Emit preceding safe chunk
+        if i > lastSafe: output.add(input[lastSafe ..< i])
+        
+        # EMIT: Encoded char or replacement
         case cp:
         of '&'.int: output.add("&amp;")
-        of '<'.int: 
-          output.add("&lt;")
+        of '<'.int: output.add("&lt;")
         of '>'.int: output.add("&gt;")
         of '\''.int: output.add("&#39;")
         of '"'.int: output.add("&#34;")
-        else:       output.add(INVALID_CHARACTER_REPLACEMENT) # e.g. \0, \1, etc.
+        else: output.add(INVALID_CHARACTER_REPLACEMENT) # e.g. \0, \1, etc.
+        
+        lastSafe = nextI # UPDATE: Mark the start of the new safe chunk
 
     elif cp < MIN_HIGH_SURROGATE: # 127 - 0xD7FF
       # Java logic: if (ch > Unicode.MAX_C1_CTRL_CHAR || ch == Unicode.NEL)
       if (cp > MAX_C1_CTRL_CHAR or cp == NEL):
-        output.add(input[i ..< nextI]) # Valid (e.g., 0xA0)
+        # Valid non-ASCII, continue to extend the safe chunk
+        discard
       else:
-        # Invalid C0 control (0x7F) or C1 control (0x80-0x9F, excl 0x85)
+        # FLUSH: Emit preceding safe chunk
+        if i > lastSafe: output.add(input[lastSafe ..< i])
+        
+        # EMIT: Replacement
         output.add(INVALID_CHARACTER_REPLACEMENT)
         
+        lastSafe = nextI # UPDATE: Mark the start of the new safe chunk
+        
     elif cp <= MAX_LOW_SURROGATE: # 0xD800 - 0xDFFF (Surrogate range)
+      var handled = false
       # Check if it's a HIGH surrogate (0xD800 - 0xDBFF)
       if cp <= MAX_HIGH_SURROGATE:
         # It's a high surrogate. Peek at the next codepoint.
         if nextI < input.len:
-          let (cp2, nextI2) = decodeUtf8(input, nextI)
+          let charLen2 = runeLenAt(input, nextI)
+          let cp2Rune = input.runeAt(nextI)
+          let cp2 = cp2Rune.int
+          let nextI2 = nextI + charLen2
           
           # Check if next is a LOW surrogate (0xDC00 - 0xDFFF)
           if cp2 >= 0xDC00 and cp2 <= MAX_LOW_SURROGATE:
             # We have a valid pair!
-            # Combine them to check for non-characters (e.g., U+1FFFE)
-            # Formula from Java's Character.toCodePoint
             let combinedCp = 0x10000 + ((cp - MIN_HIGH_SURROGATE) shl 10) + (cp2 - 0xDC00)
 
             if isNonCharacter(combinedCp):
-              # Invalid pair (e.g., U+1FFFE). Java replaces the pair with *one* space.
+              # FLUSH: Emit preceding safe chunk
+              if i > lastSafe: output.add(input[lastSafe ..< i])
+              # EMIT: Invalid pair is replaced by *one* space.
               output.add(INVALID_CHARACTER_REPLACEMENT)
+              
               i = nextI2 # Consume both codepoints
+              lastSafe = i # UPDATE: Mark the start of the new safe chunk
+              handled = true
               continue # Continue to next loop iteration
             else:
-              # Valid surrogate pair (e.g., U+10000). Pass them through.
-              output.add(input[i ..< nextI])  # Add high surrogate bytes
-              output.add(input[nextI ..< nextI2]) # Add low surrogate bytes
+              # Valid surrogate pair. Continue to extend the safe chunk.
               i = nextI2
+              handled = true
               continue # Continue to next loop iteration
         
-        # If we're here, it's a high surrogate *without* a following low surrogate.
-        # Fall through to the invalid case.
-      
-      # This handles:
-      # 1. Isolated low surrogates (0xDC00 - 0xDFFF)
-      # 2. Isolated high surrogates (fell through from above)
-      output.add(INVALID_CHARACTER_REPLACEMENT)
+      if not handled:
+        # FLUSH: Emit preceding safe chunk
+        if i > lastSafe: output.add(input[lastSafe ..< i])
+        
+        # This handles isolated surrogates (high or low)
+        output.add(INVALID_CHARACTER_REPLACEMENT)
+        lastSafe = nextI # UPDATE: Mark the start of the new safe chunk
+
 
     elif cp >= 0xFDD0: # Check for non-characters
-
       if isNonCharacter(cp):
+        # FLUSH: Emit preceding safe chunk
+        if i > lastSafe: output.add(input[lastSafe ..< i])
+        # EMIT: Replacement
         output.add(INVALID_CHARACTER_REPLACEMENT) 
+        lastSafe = nextI # UPDATE: Mark the start of the new safe chunk
       elif cp <= 0x10FFFF:
-        output.add(input[i ..< nextI]) # Valid (e.g. 0xFFFD)
+        # Valid, continue to extend the safe chunk
+        discard
       else:
-        output.add(INVALID_CHARACTER_REPLACEMENT) # > 0x10FFFF
+        # FLUSH: Emit preceding safe chunk
+        if i > lastSafe: output.add(input[lastSafe ..< i])
+        # EMIT: Replacement (> 0x10FFFF)
+        output.add(INVALID_CHARACTER_REPLACEMENT) 
+        lastSafe = nextI # UPDATE: Mark the start of the new safe chunk
 
     else:
       # All other valid chars (e.g., U+E000 - U+FDCF)
-      output.add(input[i ..< nextI])
+      # Valid, continue to extend the safe chunk
+      discard
 
     i = nextI
+    
+  # FINAL FLUSH: Copy the final safe chunk
+  if input.len > lastSafe:
+    output.add(input[lastSafe ..< input.len])
