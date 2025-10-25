@@ -6,7 +6,7 @@ import std/strformat
 
 const
   HEX: array[16, char] =
-    ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F']
+    ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f']
   HEX_SHIFT = 4
   HEX_MASK = 0x0F
   DEL = 0x7F
@@ -108,8 +108,35 @@ method firstEncodedOffset*(
 
 method encodeInternal*(encoder: JavaScriptEncoder, input: string, output: var string) =
   ## Encodes the input string by iterating over Runes (Unicode codepoints)
+  ## Optimized with Stage 1 (Safe Chunking) and Stage 2 (Direct Writes + Fast Path)
   var i = 0
+  var lastSafe = 0  # TRACKER: Start of the current safe chunk
+  
   while i < input.len:
+    # --- STAGE 2B: Minimalist Printable ASCII Skip (Final Speed Boost) ---
+    # Handle only letters and digits (most common, safest chars)
+    var fastI = i
+    while fastI < input.len:
+      let b = input[fastI].uint8
+      
+      # Skip only letters and digits (the most common, safest chars)
+      if not (b >= '0'.uint8 and b <= '9'.uint8 or 
+              b >= 'a'.uint8 and b <= 'z'.uint8 or 
+              b >= 'A'.uint8 and b <= 'Z'.uint8):
+        break
+      
+      fastI += 1
+    
+    # FLUSH: Copy the letters/digits chunk found by the Fast Path
+    if fastI > i:
+      if i > lastSafe:
+        output.add(input[lastSafe ..< i])  # Flush any preceding Rune safe chunk
+      output.add(input[i ..< fastI])  # Copy the new ASCII safe chunk
+      lastSafe = fastI
+      i = fastI
+      continue
+    # ----------------------------------------
+
     let b = input[i].uint8
 
     # --- UTF-8 decoding ---
@@ -142,7 +169,11 @@ method encodeInternal*(encoder: JavaScriptEncoder, input: string, output: var st
         (-1, i + 1) # Invalid UTF-8
     
     if cp == -1: # Invalid UTF-8
+      # STAGE 1: Flush the safe chunk before passing through invalid bytes
+      if i > lastSafe:
+        output.add(input[lastSafe ..< i])
       output.add(input[i ..< nextI]) # Pass through invalid bytes as-is
+      lastSafe = nextI
       i = nextI
       continue
 
@@ -150,18 +181,31 @@ method encodeInternal*(encoder: JavaScriptEncoder, input: string, output: var st
 
     if cp < 128: # ASCII
       if (encoder.validMasks[cp shr 5] and (1'u32 shl (cp and 31))) != 0:
-        output.add(char(cp)) #
+        # Valid passthrough character - let it accumulate in the safe chunk
+        i = nextI
+        continue
       else:
-        # Needs encoding
+        # Needs encoding - STAGE 1: Flush the safe chunk before encoded char
+        if i > lastSafe:
+          output.add(input[lastSafe ..< i])
+        
+        # STAGE 2A: Direct Entity Writes (no string literals)
         case cp
-        of '\b'.int: output.add("\\b")
-        of '\t'.int: output.add("\\t")
-        of '\n'.int: output.add("\\n")
-        of '\f'.int: output.add("\\f")
-        of '\r'.int: output.add("\\r")
+        of '\b'.int:
+          output.add("\\b")
+        of '\t'.int:
+          output.add("\\t")
+        of '\n'.int:
+          output.add("\\n")
+        of '\f'.int:
+          output.add("\\f")
+        of '\r'.int:
+          output.add("\\r")
         of '\''.int, '"'.int:
           if encoder.hexEncodeQuotes:
-            output.add(fmt"\\x{cp:02x}")
+            output.add("\\x")
+            output.add(HEX[(cp shr 4) and 0xF])
+            output.add(HEX[cp and 0xF])
           else:
             output.add('\\')
             output.add(char(cp))
@@ -169,14 +213,37 @@ method encodeInternal*(encoder: JavaScriptEncoder, input: string, output: var st
           output.add('\\')
           output.add(char(cp))
         else: # Other C0 controls, \v, etc.
-          output.add(fmt"\\x{cp:02x}")
+          output.add("\\x")
+          output.add(HEX[(cp shr 4) and 0xF])
+          output.add(HEX[cp and 0xF])
+        
+        lastSafe = nextI
     else: # Non-ASCII
       if encoder.asciiOnly or cp == LINE_SEPARATOR or cp == PARAGRAPH_SEPARATOR:
+        # Needs encoding - STAGE 1: Flush the safe chunk before encoded char
+        if i > lastSafe:
+          output.add(input[lastSafe ..< i])
+        
+        # STAGE 2A: Direct Entity Writes (no string literals)
         if cp <= 0xFF:
-          output.add(fmt"\\x{cp:02x}")
+          output.add("\\x")
+          output.add(HEX[(cp shr 4) and 0xF])
+          output.add(HEX[cp and 0xF])
         else:
-          output.add(fmt"\\u{cp:04x}")
+          output.add("\\u")
+          output.add(HEX[(cp shr 12) and 0xF])
+          output.add(HEX[(cp shr 8) and 0xF])
+          output.add(HEX[(cp shr 4) and 0xF])
+          output.add(HEX[cp and 0xF])
+        
+        lastSafe = nextI
       else:
-        output.add(input[i ..< nextI]) # Pass through valid Unicode
+        # Valid passthrough character - let it accumulate in the safe chunk
+        i = nextI
+        continue
 
     i = nextI
+
+  # STAGE 1 - FINAL FLUSH: Copy the final safe chunk
+  if input.len > lastSafe:
+    output.add(input[lastSafe ..< input.len])

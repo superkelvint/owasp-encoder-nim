@@ -104,9 +104,40 @@ method firstEncodedOffset*(
 method encodeInternal*(encoder: URIEncoder, input: string, output: var string) =
   ## Encodes the input string by iterating over Runes (Unicode codepoints)
   var i = 0
-  while i < input.len:
-    let b = input[i].uint8
+  var lastSafe = 0 # TRACKER: Start of the current safe chunk
 
+  while i < input.len:
+    # --- INSERT MINIMALIST FAST PATH HERE ---
+    var fastI = i
+    while fastI < input.len:
+      let ch = input[fastI]
+      let cp = ord(ch)
+      
+      # Skip only characters that are guaranteed safe and are ASCII
+      # This fast path must only skip single-byte, unreserved characters.
+      # The UNRESERVED_MASK logic covers 'a'-'z', 'A'-'Z', '0'-'9', '-', '.', '_', '~'
+      # which are the safest. We check the masks for a fast, safe skip.
+      if cp <= 127 and (
+        (cp < LONG_BITS and (encoder.lowMask and (1'u64 shl cp)) != 0) or
+        (cp >= LONG_BITS and (encoder.highMask and (1'u64 shl (cp - LONG_BITS))) != 0)
+      ):
+        fastI += 1
+      else:
+        break
+        
+    # FLUSH: Copy the safe chunk found by the Fast Path
+    if fastI > i:
+      if i > lastSafe: # Flush any preceding Rune safe chunk (shouldn't happen here, but safe)
+        output.add(input[lastSafe ..< i]) 
+      output.add(input[i ..< fastI]) # Copy the new ASCII safe chunk
+      lastSafe = fastI
+      i = fastI
+      continue # Continue to next iteration
+    # ----------------------------------------
+    
+    # Original Rune processing logic starts here
+    let b = input[i].uint8
+    
     # Determine how many bytes this UTF-8 sequence contains
     let (cp, nextI) =
       if (b and 0x80) == 0:
@@ -150,9 +181,18 @@ method encodeInternal*(encoder: URIEncoder, input: string, output: var string) =
     # Now encode the codepoint
     # Check for invalid codepoints (surrogates or replacement char)
     if cp == int(INVALID_REPLACEMENT_CHARACTER) or (cp >= 0xD800 and cp <= 0xDFFF):
+      # FLUSH: Copy the preceding safe chunk
+      if i > lastSafe:
+        output.add(input[lastSafe ..< i]) 
+      
       output.add(INVALID_REPLACEMENT_CHARACTER)
+      lastSafe = nextI # UPDATE tracker
     elif encoder.needsEncoding(cp):
-      # Encode as UTF-8 bytes
+      # FLUSH: Copy the preceding safe chunk
+      if i > lastSafe:
+        output.add(input[lastSafe ..< i]) 
+        
+      # Encode as UTF-8 bytes (Using addPercentEncoded which is already direct)
       if cp <= 0x7F:
         # 1-byte
         output.addPercentEncoded(cp)
@@ -171,8 +211,15 @@ method encodeInternal*(encoder: URIEncoder, input: string, output: var string) =
         output.addPercentEncoded((0x80 or ((cp shr 12) and 0x3F)))
         output.addPercentEncoded((0x80 or ((cp shr 6) and 0x3F)))
         output.addPercentEncoded((0x80 or (cp and 0x3F)))
+        
+      lastSafe = nextI # UPDATE tracker
     else:
-      # Valid character, no encoding needed - add it as-is
-      output.add(input[i ..< nextI])
+      # Valid character, no encoding needed - discard old logic
+      # output.add(input[i ..< nextI]) # OLD LOGIC REMOVED
+      discard # Character is safe; just advance i
 
     i = nextI
+    
+  # FINAL FLUSH: Copy the final safe chunk
+  if input.len > lastSafe:
+    output.add(input[lastSafe ..< input.len])
