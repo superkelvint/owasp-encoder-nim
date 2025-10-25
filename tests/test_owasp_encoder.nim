@@ -170,19 +170,19 @@ test "Encode forUriComponent":
 
 test "Encode forJavaScript (HTML)":
   # Default HTML mode encodes quotes as \x.. and / as \/
-  check forJavaScript("'foo'") == "\\\\x27foo\\\\x27"
+  check forJavaScript("'foo'") == "\\x27foo\\x27"
   check forJavaScript("</script>") == "<\\/script>"
   var s = newStringStream()
   forJavaScript(s, "'&'")
-  check s.data == "\\\\x27\\&\\\\x27"
+  check s.data == "\\x27\\&\\x27"
 
 test "Encode forJavaScriptAttribute":
   # Encodes quotes as \x.. but not /
-  check forJavaScriptAttribute("'foo'") == "\\\\x27foo\\\\x27"
+  check forJavaScriptAttribute("'foo'") == "\\x27foo\\x27"
   check forJavaScriptAttribute("</script>") == "</script>"
   var s = newStringStream()
   forJavaScriptAttribute(s, "'&'")
-  check s.data == "\\\\x27\\&\\\\x27"
+  check s.data == "\\x27\\&\\x27"
 
 test "Encode forJavaScriptBlock":
   # Encodes quotes as \' and / as \/
