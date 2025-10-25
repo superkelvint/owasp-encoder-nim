@@ -4,6 +4,8 @@
 
 A Nim port of the industry-standard [OWASP Java Encoder](https://github.com/OWASP/owasp-java-encoder) library.
 
+This port is based on OWASP Java Encoder version 1.3.1 (released 2024-08-20).
+
 This library provides context-aware, secure output encoding to help developers prevent Cross-Site Scripting (XSS) and other injection vulnerabilities.
 
 It is a faithful port that passes the complete test suite from the original Java project, ensuring identical behavior and security. (The only component not ported is the `JavaEncoder`, which is not relevant for Nim).
